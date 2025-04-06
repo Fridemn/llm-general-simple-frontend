@@ -2,14 +2,30 @@
   <div class="card">
     <h2 class="text-xl font-semibold text-center text-gray-700 mb-4">语音交互</h2>
     <div class="btn-group">
-      <button id="startRecordBtn" class="primary" @click="$emit('start-record')" :disabled="startRecordBtnDisabled">开始录音</button>
-      <button id="stopRecordBtn" class="secondary" @click="$emit('stop-record')" :disabled="stopRecordBtnDisabled">停止录音</button>
+      <button id="start-record-btn" class="primary" 
+              @click="$emit('start-record')" 
+              :disabled="startRecordBtnDisabled">
+        开始实时对话
+      </button>
+      <button id="stop-record-btn" class="secondary" 
+              @click="$emit('stop-record')" 
+              :disabled="stopRecordBtnDisabled">
+        停止对话
+      </button>
     </div>
-    <div class="w-full h-5 bg-gray-200 rounded-md overflow-hidden mt-4">
-      <div class="h-full bg-green-600 text-center text-white text-xs leading-5 transition-all duration-300" 
-           :style="{ width: progressWidth }">{{ progressText }}</div>
+    <div class="status">{{ statusText }}</div>
+    
+    <div v-if="isVoiceChatting" class="voice-status mt-2">
+      <div class="status-text text-center">正在聆听...</div>
+      <div class="voice-indicator mx-auto mt-2" :class="{ active: isSpeaking }"></div>
     </div>
-    <div id="statusDisplay" class="status mt-2 text-gray-700">{{ statusText }}</div>
+    
+    <div v-if="progressWidth && progressWidth !== '0%'" class="recording-progress mt-3">
+      <div class="bg-gray-200 rounded-full h-2.5 overflow-hidden">
+        <div class="bg-blue-600 h-full" :style="{ width: progressWidth }"></div>
+      </div>
+      <div class="text-xs text-center mt-1 text-gray-600">{{ progressText }}</div>
+    </div>
   </div>
 </template>
 
@@ -19,7 +35,7 @@ export default {
   props: {
     startRecordBtnDisabled: {
       type: Boolean,
-      default: true
+      default: false
     },
     stopRecordBtnDisabled: {
       type: Boolean,
@@ -35,7 +51,15 @@ export default {
     },
     statusText: {
       type: String,
-      default: '等待连接...'
+      default: '准备就绪'
+    },
+    isVoiceChatting: {
+      type: Boolean,
+      default: false
+    },
+    isSpeaking: {
+      type: Boolean,
+      default: false
     }
   },
   emits: ['start-record', 'stop-record']
@@ -43,5 +67,27 @@ export default {
 </script>
 
 <style scoped>
-/* 使用Tailwind替代了这些自定义样式 */
+.voice-indicator {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background-color: #ccc;
+}
+
+.voice-indicator.active {
+  background-color: #4CAF50;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.2); }
+  100% { transform: scale(1); }
+}
+
+.voice-status {
+  padding: 8px;
+  background-color: #f0f9ff;
+  border-radius: 4px;
+}
 </style>

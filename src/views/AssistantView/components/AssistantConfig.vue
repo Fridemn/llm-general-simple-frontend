@@ -18,12 +18,6 @@
         <button id="create-history-btn" class="neutral ml-3" @click="$emit('create-new-history')" 
                 :disabled="createHistoryBtnDisabled">创建新对话</button>
       </div>
-      <div class="config-row">
-        <label for="duration" class="text-gray-700">录音时长 (秒):</label>
-        <input type="number" id="duration" min="1" max="60" :value="duration" 
-               @input="$emit('update:duration', Number($event.target.value))" 
-               class="w-24" />
-      </div>
     </div>
   </div>
 </template>
@@ -47,21 +41,13 @@ export default {
     createHistoryBtnDisabled: {
       type: Boolean,
       default: true
-    },
-    duration: {
-      type: Number,
-      default: 2
     }
   },
-  emits: ['update:history-id', 'update:selected-model', 'update:duration', 'create-new-history'],
+  emits: ['update:history-id', 'update:selected-model', 'create-new-history'],
   mounted() {
     // 确保historyId有值，如果为空则使用默认值
     if (!this.historyId) {
       this.$emit('update:history-id', '01d49649-003f-4587-a610-229ef6f9b9ad');
-    }
-    
-    if (!this.duration) {
-      this.$emit('update:duration', 2);
     }
   }
 };

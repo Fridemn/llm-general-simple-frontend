@@ -19,10 +19,8 @@
       :selected-model="selectedModel"
       :available-models="availableModels"
       :create-history-btn-disabled="createHistoryBtnDisabled"
-      :duration="duration"
       @update:history-id="historyId = $event; onHistoryIdChange()"
       @update:selected-model="selectedModel = $event; setSessionParams()"
-      @update:duration="duration = $event"
       @create-new-history="createNewHistory"
     />
     
@@ -43,8 +41,10 @@
       :progress-width="progressWidth"
       :progress-text="progressText"
       :status-text="statusText"
+      :is-voice-chatting="isRecording"
+      :is-speaking="isSpeaking"
       @start-record="startVoiceChat"
-      @stop-record="stopRecording"
+      @stop-record="stopVoiceChat"
     />
     
     <ConversationHistory :conversation-history="conversationHistory" />
@@ -52,6 +52,7 @@
     <AudioOutput 
       ref="audioPlayerComponent"
       :current-audio="currentAudio"
+      :audio-queue="audioQueue"
       :muted="shouldMuteLocalAudio"
       @audio-ended="onAudioEnded"
       @audio-error="onAudioError"
@@ -64,7 +65,7 @@
 </template>
 
 <script>
-import { ref, onMounted, computed, inject } from 'vue'; // 添加inject引入
+import { ref, onMounted, computed, inject, onUnmounted } from 'vue'; // 添加onUnmounted引入
 import ConnectionSettings from './components/ConnectionSettings.vue';
 import AssistantConfig from './components/AssistantConfig.vue';
 import TTSSettings from './components/TTSSettings.vue';
@@ -101,9 +102,14 @@ export default {
     const currentStreamBuffer = ref('');
     const heartbeatInterval = ref(null);
     const lastServerActivity = ref(Date.now());
+    const isSpeaking = ref(false); // 添加是否正在说话的状态
 
-    const apiUrl = ref('ws://localhost:8000/ws/voice-assistant');
-    const duration = ref(10);
+    // 添加重连控制
+    const maxReconnectAttempts = ref(3);
+    const reconnectCount = ref(0);
+    const reconnectDelay = ref(1000); // 初始延迟1秒
+
+    const apiUrl = ref('ws://localhost:8000/ws/realtime-voice-chat'); // 修改默认URL
     const selectedModel = ref('');
     const provider = ref('gsvi');
     const apiBase = ref('http://127.0.0.1:5000');
@@ -125,7 +131,9 @@ export default {
     const connectBtnDisabled = computed(() => isConnected.value);
     const disconnectBtnDisabled = computed(() => !isConnected.value);
     const createHistoryBtnDisabled = computed(() => !isConnected.value);
-    const startRecordBtnDisabled = computed(() => !(isConnected.value && historyId.value && selectedModel.value) || isRecording.value);
+    const startRecordBtnDisabled = computed(() => {
+      return !(isConnected.value && historyId.value && selectedModel.value) || isRecording.value;
+    });
     const stopRecordBtnDisabled = computed(() => !isRecording.value);
 
     // 计算属性：当Live2D可见时，本地音频应该静音
@@ -133,7 +141,7 @@ export default {
       return !!(live2dControls && live2dControls.isVisible.value);
     });
 
-    // WebSocket connection function
+    // WebSocket connection function with reconnect logic
     const connectWebSocket = () => {
       try {
         const wsUrl = apiUrl.value.trim();
@@ -156,6 +164,14 @@ export default {
 
         socket.value = new WebSocket(wsUrl);
         
+        // 设置连接超时
+        const connectionTimeout = setTimeout(() => {
+          if (socket.value && socket.value.readyState !== WebSocket.OPEN) {
+            socket.value.close();
+            handleConnectionError('连接超时');
+          }
+        }, 5000);
+        
         // 添加更详细的错误处理
         socket.value.addEventListener('error', (event) => {
             console.error('WebSocket Error:', event);
@@ -163,37 +179,19 @@ export default {
         });
 
         socket.value.onopen = () => {
+            clearTimeout(connectionTimeout);
             console.log('WebSocket连接已打开');
             addToLog('WebSocket连接已打开');
             updateStatus('已连接到服务器');
             updateConnectionStatus('已连接', 'connected');
             isConnected.value = true;
+            reconnectCount.value = 0;  // 重置重连计数
             fetchAvailableModels();
             startHeartbeat();
         };
 
-        socket.value.onclose = (event) => {
-          const reason = event.reason ? event.reason : "未提供关闭原因";
-          const code = event.code;
-          addToLog(`WebSocket连接已关闭 - 代码: ${code}, 原因: ${reason}`);
-          
-          updateConnectionStatus('未连接', 'disconnected');
-          updateStatus('连接已关闭');
-          resetConnectionState();
-        };
-
-        socket.value.onerror = (error) => {
-          console.error('WebSocket Error:', error);
-          addToLog(`WebSocket错误: ${error}`);
-          // 如果是连接阶段的错误，让 onclose 处理重试
-          if (!isConnected.value) {
-            return;
-          }
-          updateStatus('连接错误');
-          updateConnectionStatus('连接错误', 'disconnected');
-          resetConnectionState();
-        };
-
+        socket.value.onclose = handleDisconnect;
+        socket.value.onerror = handleConnectionError;
         socket.value.onmessage = handleServerMessage;
 
       } catch (error) {
@@ -204,13 +202,61 @@ export default {
       }
     };
 
+    // 处理连接关闭
+    const handleDisconnect = (event) => {
+      stopHeartbeat();
+      isConnected.value = false;
+      isRecording.value = false;
+      isSpeaking.value = false;
+      
+      const reason = event.reason || '未知原因';
+      updateConnectionStatus('未连接', 'disconnected');
+      updateStatus('连接已关闭');
+      addToLog(`WebSocket连接已关闭 - 代码: ${event.code}, 原因: ${reason}`);
+      
+      // 如果不是用户主动关闭，尝试重连
+      if (event.code !== 1000 && reconnectCount.value < maxReconnectAttempts.value) {
+        reconnectCount.value++;
+        const delay = reconnectDelay.value * reconnectCount.value;
+        addToLog(`将在 ${delay/1000} 秒后尝试重连(${reconnectCount.value}/${maxReconnectAttempts.value})...`);
+        
+        setTimeout(() => {
+          connectWebSocket();
+        }, delay);
+      }
+    };
+
+    // 处理连接错误
+    const handleConnectionError = (error) => {
+      console.error('WebSocket Error:', error);
+      addToLog(`WebSocket错误: ${error}`);
+      
+      if (!isConnected.value) {
+        return; // 让 onclose 处理重试
+      }
+      
+      updateStatus('连接错误');
+      updateConnectionStatus('连接错误', 'disconnected');
+      
+      // 尝试重连
+      if (reconnectCount.value < maxReconnectAttempts.value) {
+        reconnectCount.value++;
+        const delay = reconnectDelay.value * reconnectCount.value;
+        addToLog(`将在 ${delay/1000} 秒后尝试重连(${reconnectCount.value}/${maxReconnectAttempts.value})...`);
+        
+        setTimeout(() => {
+          connectWebSocket();
+        }, delay);
+      }
+    };
+
     // WebSocket disconnection function
     const disconnectWebSocket = () => {
       stopHeartbeat();
 
       if (socket.value && socket.value.readyState === WebSocket.OPEN) {
         addToLog('断开连接');
-        socket.value.close();
+        socket.value.close(1000, '用户主动断开');
         updateStatus('已断开连接');
         updateConnectionStatus('已断开', 'disconnected');
       }
@@ -226,7 +272,7 @@ export default {
     // Reset connection state
     const resetConnectionState = () => {
       isConnected.value = false;
-      if (isRecording.value) stopRecording();
+      if (isRecording.value) stopVoiceChat();
 
       progressWidth.value = '0%';
       progressText.value = '0%';
@@ -268,10 +314,8 @@ export default {
       }
 
       socket.value.send(JSON.stringify(params));
+      addToLog('已更新会话参数');
     };
-
-    // 其他方法保持不变
-    // ...existing code...
 
     // Fetch available models
     const fetchAvailableModels = async () => {
@@ -327,7 +371,7 @@ export default {
       }
     };
 
-    // Start voice chat
+    // Start voice chat - 修改为实时语音对话
     const startVoiceChat = () => {
       if (!socket.value || socket.value.readyState !== WebSocket.OPEN) {
         addToLog('WebSocket未连接');
@@ -346,44 +390,34 @@ export default {
         return;
       }
 
-      const durationValue = parseInt(duration.value);
-      const model = selectedModel.value;
-
       setSessionParams();
 
-      progressWidth.value = '0%';
-      progressText.value = '0%';
-
-      currentStreamMessage.value = null;
-
-      updateStatus('准备录音...');
-
-      addMessageToConversation('正在录音...', 'user');
+      updateStatus('开始实时语音对话...');
 
       socket.value.send(JSON.stringify({
-        command: 'start_voice_chat',
-        duration: durationValue,
-        model: model,
-        history_id: historyId.value,
+        command: 'start',
         server_url: "ws://127.0.0.1:8765"
       }));
 
       isRecording.value = true;
+      addToLog('开始实时语音对话');
     };
 
-    // Stop recording
-    const stopRecording = () => {
+    // Stop recording - 修改为停止实时对话
+    const stopVoiceChat = () => {
       if (!socket.value || socket.value.readyState !== WebSocket.OPEN || !isRecording.value) {
         return;
       }
 
-      addToLog('手动停止录音');
-      socket.value.send(JSON.stringify({ command: 'stop_recording' }));
+      addToLog('停止实时语音对话');
+      socket.value.send(JSON.stringify({ command: 'stop' }));
 
-      updateStatus('识别中...');
+      isRecording.value = false;
+      isSpeaking.value = false;
+      updateStatus('已停止语音对话');
     };
 
-    // Handle server message
+    // Handle server message - 更新为适应实时语音对话
     const handleServerMessage = async (event) => {
       try {
         lastServerActivity.value = Date.now();
@@ -418,22 +452,31 @@ export default {
             }
             break;
 
-          case 'recording':
-            handleRecordingMessage(message);
+          case 'start':
+            if (message.status === 'success') {
+              updateStatus('实时语音对话已启动');
+            }
             break;
 
-          case 'partial_result':
-            updateStatus(`识别中: ${message.text}`);
+          case 'stop':
+            if (message.status === 'success') {
+              isRecording.value = false;
+              updateStatus('实时语音对话已停止');
+            }
+            break;
+
+          case 'voice_activity':
+            handleVoiceActivity(message);
             break;
 
           case 'recognition_result':
-          case 'asr_result':
-            const text = message.text || '';
-            updateStatus(`已识别: ${text.substring(0, 30)}${text.length > 30 ? '...' : ''}`);
-            replaceUserMessage(text);
+            handleRecognitionResult(message);
             break;
 
-          case 'llm_request_start':
+          case 'llm_stream_chunk':
+            handleLLMStreamChunk(message);
+            break;
+          
           case 'llm_stream_start':
             updateStatus('LLM处理中...');
             isProcessingLlm.value = true;
@@ -445,16 +488,6 @@ export default {
             currentStreamBuffer.value = '';
             break;
 
-          case 'llm_response_chunk':
-          case 'llm_stream_chunk':
-            const content = message.chunk || message.content || '';
-            if (content) {
-              appendToLastMessage(content);
-              currentStreamBuffer.value += content;
-            }
-            break;
-
-          case 'llm_response_complete':
           case 'llm_stream_end':
             updateStatus('LLM处理完成，准备生成语音...');
             isProcessingLlm.value = false;
@@ -468,44 +501,6 @@ export default {
               historyId.value = message.history_id;
               addToLog(`更新对话历史ID: ${historyId.value}`);
             }
-
-            if (currentStreamBuffer.value) {
-              const fullResponse = currentStreamBuffer.value;
-              addToLog(`LLM响应完成，字数: ${fullResponse.length}`);
-
-              socket.value.send(JSON.stringify({
-                command: 'llm_stream_end',
-                text: fullResponse
-              }));
-            } else if (message.text) {
-              addToLog(`LLM响应完成，字数: ${message.text.length}`);
-              socket.value.send(JSON.stringify({
-                command: 'llm_stream_end',
-                text: message.text
-              }));
-            } else {
-              addToLog('警告：未能收集到完整的LLM响应文本');
-            }
-            break;
-
-          case 'llm_response':
-            updateStatus('LLM响应已完成');
-            const building = document.querySelector('.assistant-response-building');
-            if (building) {
-              building.textContent = message.text;
-              building.classList.remove('assistant-response-building');
-            } else {
-              addMessageToConversation(message.text, 'assistant');
-            }
-
-            if (message.audio_url) {
-              playAudioResponse(message.audio_url);
-            }
-
-            if (message.history_id && (!historyId.value || historyId.value !== message.history_id)) {
-              historyId.value = message.history_id;
-              addToLog(`更新对话历史ID: ${historyId.value}`);
-            }
             break;
 
           case 'tts_start':
@@ -513,33 +508,8 @@ export default {
             addToLog('TTS处理开始');
             break;
 
-          case 'tts_complete':
-            updateStatus('语音生成完成');
-            if (message.audio_url) {
-              addToLog(`TTS处理完成，音频URL: ${message.audio_url}`);
-              playAudioResponse(message.audio_url);
-
-              setTimeout(() => {
-                if (socket.value && socket.value.readyState === WebSocket.OPEN) {
-                  sendHeartbeat();
-                }
-              }, 500);
-            } else {
-              addToLog('TTS处理完成，但未返回音频URL');
-            }
-            break;
-
           case 'tts_sentence_complete':
-            // 将新的音频添加到队列
-            audioQueue.value.push({
-              url: window.location.protocol + '//' + window.location.hostname + ':8000' + message.audio_url,
-              text: message.text
-            });
-            
-            // 如果没有正在播放，开始播放
-            if (!isPlaying.value) {
-              playNextAudio();
-            }
+            handleTTSSentenceComplete(message);
             break;
 
           case 'error':
@@ -551,7 +521,7 @@ export default {
             break;
 
           default:
-            console.log('Received message:', message);
+            console.log('接收到未处理消息类型:', message);
         }
 
       } catch (error) {
@@ -560,35 +530,53 @@ export default {
       }
     };
 
-    // Handle recording message
-    const handleRecordingMessage = (message) => {
-      switch (message.status) {
-        case 'started':
-          isRecording.value = true;
-          updateStatus('录音已开始...');
-          break;
+    // 新增：处理语音活动检测
+    const handleVoiceActivity = (message) => {
+      if (message.is_speaking !== undefined) {
+        isSpeaking.value = message.is_speaking;
+      }
+    };
 
-        case 'progress':
-          const percentage = message.percentage;
-          progressWidth.value = `${percentage}%`;
-          progressText.value = `${percentage}%`;
-          updateStatus(`录音中... ${message.current}秒/${message.total}秒`);
-          break;
+    // 新增：处理语音识别结果
+    const handleRecognitionResult = (message) => {
+      const text = message.text || '';
+      updateStatus(`已识别: ${text.substring(0, 30)}${text.length > 30 ? '...' : ''}`);
+      addMessageToConversation(text, 'user');
+      isSpeaking.value = false;
+    };
 
-        case 'info':
-          updateStatus(message.message);
-          addToLog(message.message);
-          break;
+    // 新增：处理LLM流式输出
+    const handleLLMStreamChunk = (message) => {
+      const content = message.content || message.chunk || '';
+      if (content) {
+        if (!document.querySelector('.assistant-response-building')) {
+          addMessageToConversation('', 'assistant', 'assistant-response-building');
+        }
+        appendToLastMessage(content);
+        currentStreamBuffer.value += content;
+      }
+    };
 
-        case 'stopped':
-          isRecording.value = false;
-          updateStatus('录音已手动停止');
-          break;
-
-        case 'completed':
-          isRecording.value = false;
-          updateStatus('录音完成，等待语音识别...');
-          break;
+    // 新增：处理TTS句子完成
+    const handleTTSSentenceComplete = (message) => {
+      // 将新的音频添加到队列
+      const fullUrl = window.location.protocol + '//' + window.location.hostname + ':8000' + message.audio_url;
+      
+      // 检查队列中是否已存在相同URL的音频
+      if (audioQueue.value.some(audio => audio.url === fullUrl)) {
+        addToLog(`跳过重复音频: ${message.audio_url}`);
+        return;
+      }
+      
+      addToLog(`收到TTS音频: ${message.text.substring(0, 20)}...`);
+      audioQueue.value.push({
+        url: fullUrl,
+        text: message.text
+      });
+      
+      // 如果没有正在播放，开始播放
+      if (!isPlaying.value) {
+        playNextAudio();
       }
     };
 
@@ -603,16 +591,6 @@ export default {
       conversationHistory.value.push({ sender: sender, text: text, className: className });
     };
 
-    // Replace last user message
-    const replaceUserMessage = (text) => {
-      const userMessages = conversationHistory.value.filter(message => message.sender === 'user');
-      if (userMessages.length > 0) {
-        userMessages[userMessages.length - 1].text = text;
-      } else {
-        addMessageToConversation(text, 'user');
-      }
-    };
-
     // Append to last message
     const appendToLastMessage = (text) => {
       const lastMessage = conversationHistory.value.find(message => message.className === 'assistant-response-building');
@@ -621,7 +599,7 @@ export default {
       }
     };
 
-    // Play audio response - 修改为支持Live2D
+    // Play audio response
     const playAudioResponse = (url) => {
       const baseUrl = window.location.protocol + '//' + window.location.hostname + ':8000';
       const fullUrl = baseUrl + url;
@@ -676,7 +654,7 @@ export default {
     const sendHeartbeat = () => {
       try {
         socket.value.send(JSON.stringify({
-          keep_alive: true,
+          type: 'ping',
           timestamp: Date.now()
         }));
         console.log('发送心跳...');
@@ -840,6 +818,15 @@ export default {
 
       addToLog('页面已加载，请点击"连接"按钮连接到WebSocket服务器');
     });
+    
+    // 在组件卸载时清理资源
+    onUnmounted(() => {
+      if (socket.value) {
+        socket.value.close();
+        socket.value = null;
+      }
+      stopHeartbeat();
+    });
 
     return {
       socket,
@@ -850,7 +837,6 @@ export default {
       historyId,
       availableModels,
       apiUrl,
-      duration,
       selectedModel,
       provider,
       apiBase,
@@ -876,12 +862,10 @@ export default {
       fetchAvailableModels,
       createNewHistory,
       startVoiceChat,
-      stopRecording,
+      stopVoiceChat,
       handleServerMessage,
-      handleRecordingMessage,
       updateStatus,
       addMessageToConversation,
-      replaceUserMessage,
       appendToLastMessage,
       playAudioResponse,
       addToLog,
@@ -896,7 +880,8 @@ export default {
       onHistoryIdChange,
       currentAudio,
       dispatchAudioEvent,
-      shouldMuteLocalAudio
+      shouldMuteLocalAudio,
+      isSpeaking
     };
   }
 };
@@ -962,5 +947,23 @@ button.neutral {
 
 button:disabled {
   @apply bg-gray-400 cursor-not-allowed hover:bg-gray-400;
+}
+
+.voice-indicator {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background-color: #ccc;
+}
+
+.voice-indicator.active {
+  background-color: #4CAF50;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.2); }
+  100% { transform: scale(1); }
 }
 </style>

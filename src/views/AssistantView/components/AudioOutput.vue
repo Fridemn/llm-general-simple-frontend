@@ -7,15 +7,26 @@
              @ended="handleAudioEnded"
              @error="handleError"
              @loadstart="$emit('audio-load-start')"
-             @canplay="$emit('audio-can-play')"
+             @canplay="handleAudioCanPlay"
              @play="handleAudioPlay"
              @pause="handleAudioPause"
+             @timeupdate="handleTimeUpdate"
              :muted="muted"
              class="hidden ai-audio">
       </audio>
-      <div v-if="currentAudio" class="p-3 my-2 bg-blue-100 rounded-md text-center">
-        正在播放: {{ currentAudio.text || '语音响应' }}
-        <span v-if="muted" class="text-xs text-gray-500 ml-2">(数字人模式)</span>
+      <div v-if="currentAudio" class="p-3 my-2 bg-blue-100 rounded-md">
+        <div class="audio-progress mb-2">
+          <div class="progress-bar h-1 bg-gray-300 rounded-full overflow-hidden">
+            <div class="progress h-full bg-blue-600 transition-all" :style="{ width: progressWidth }"></div>
+          </div>
+        </div>
+        <div class="text-center">
+          正在播放: {{ currentAudio.text || '语音响应' }}
+          <span v-if="muted" class="text-xs text-gray-500 ml-2">(数字人模式)</span>
+        </div>
+      </div>
+      <div v-else-if="audioQueue.length > 0" class="p-3 my-2 bg-gray-100 rounded-md text-center text-gray-600">
+        队列中: {{ audioQueue.length }} 个音频片段
       </div>
     </div>
   </div>
@@ -26,12 +37,15 @@ export default {
   name: 'AudioOutput',
   props: {
     currentAudio: { type: Object, default: null },
-    muted: { type: Boolean, default: false }
+    muted: { type: Boolean, default: false },
+    audioQueue: { type: Array, default: () => [] }
   },
   data() {
     return {
       audioElementId: 'assistant-audio-player',
-      segmentIndex: 0
+      segmentIndex: 0,
+      progress: 0,
+      progressWidth: '0%'
     }
   },
   emits: ['audio-ended', 'audio-error', 'audio-load-start', 'audio-can-play'],
@@ -69,6 +83,21 @@ export default {
       this.dispatchAudioEvent('ai-audio-ended');
       this.$emit('audio-ended');
       this.segmentIndex++;
+      this.progress = 0;
+      this.progressWidth = '0%';
+    },
+    
+    handleAudioCanPlay(event) {
+      this.$emit('audio-can-play');
+      this.progress = 0;
+      this.progressWidth = '0%';
+    },
+    
+    handleTimeUpdate(event) {
+      if (this.$refs.audioPlayer && this.$refs.audioPlayer.duration) {
+        this.progress = (this.$refs.audioPlayer.currentTime / this.$refs.audioPlayer.duration) * 100;
+        this.progressWidth = `${this.progress}%`;
+      }
     },
     
     play(url) {
@@ -90,6 +119,8 @@ export default {
       // 重置段索引如果是新的音频URL
       if (!oldAudio || newAudio.url !== oldAudio.url) {
         this.segmentIndex = 0;
+        this.progress = 0;
+        this.progressWidth = '0%';
       }
       
       // 设置ID和播放音频
